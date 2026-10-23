@@ -19,18 +19,32 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Set up JDK 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: 'temurin'
           java-version: '17'
 
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
+        with:
+          accept-android-sdk-licenses: true
+
+      - name: Accept Android SDK licenses (fallback)
+        run: |
+          # Pastikan sdkmanager tersedia lewat path absolut
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          if [ ! -f "$SDKMANAGER" ]; then
+            SDKMANAGER="$(command -v sdkmanager)"
+          fi
+          yes | "$SDKMANAGER" --licenses || true
 
       - name: Install build-tools & platform
         run: |
-          yes | sdkmanager --licenses > /dev/null
-          sdkmanager "platforms;$ANDROID_PLATFORM" "build-tools;$BUILD_TOOLS_VERSION"
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          if [ ! -f "$SDKMANAGER" ]; then
+            SDKMANAGER="$(command -v sdkmanager)"
+          fi
+          yes | "$SDKMANAGER" "platforms;$ANDROID_PLATFORM" "build-tools;$BUILD_TOOLS_VERSION" || true
           echo "BUILD_TOOLS=$ANDROID_HOME/build-tools/$BUILD_TOOLS_VERSION" >> $GITHUB_ENV
 
       - name: Download HiddenApiBypass ${{ env.HIDDENAPI_VERSION }}
