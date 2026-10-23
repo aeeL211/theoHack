@@ -173,7 +173,7 @@ public class Loader extends Application implements InvocationHandler {
    * field is part of the library's public API.
    */
   private static void hookPay() {
-    Thread t = new Thread(() -> {
+    Thread th = new Thread(() -> {
       try {
         Class<?> pm = null;
         for (int i = 0; i < 600 && pm == null; i++) {
@@ -206,8 +206,8 @@ public class Loader extends Application implements InvocationHandler {
         Log.e(TAG, "hookPay failed", t);
       }
     }, "PayHook");
-    t.setDaemon(true);
-    t.start();
+    th.setDaemon(true);
+    th.start();
   }
 
   /**
