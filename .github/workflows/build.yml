@@ -27,29 +27,32 @@ jobs:
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
         with:
-          # KUNCI PERBAIKAN:
-          # Default v3 adalah "tools platform-tools", padahal 'tools' sudah dihapus.
-          # Kosongkan agar tidak ada paket yang diminta.
           packages: ''
           accept-android-sdk-licenses: true
 
       - name: Install build-tools & platform
         run: |
-          # sdkmanager sudah tersedia dari step sebelumnya.
-          # Kita instal paket yang benar-benar dibutuhkan.
           yes | sdkmanager "platforms;$ANDROID_PLATFORM" "build-tools;$BUILD_TOOLS_VERSION"
           echo "BUILD_TOOLS=$ANDROID_HOME/build-tools/$BUILD_TOOLS_VERSION" >> $GITHUB_ENV
 
-      - name: Download HiddenApiBypass ${{ env.HIDDENAPI_VERSION }}
+      - name: Download HiddenApiBypass ${{ env.HIDDENAPI_VERSION }} (AAR)
         run: |
-          curl -L -o hiddenapibypass.jar \
-          "https://github.com/LSPosed/AndroidHiddenApiBypass/releases/download/${HIDDENAPI_VERSION}/hiddenapibypass-${HIDDENAPI_VERSION}.jar"
+          # Maven Central: tersedia sebagai .aar, bukan .jar
+          curl -L -o hiddenapibypass.aar \
+            "https://repo1.maven.org/maven2/org/lsposed/hiddenapibypass/hiddenapibypass/${HIDDENAPI_VERSION}/hiddenapibypass-${HIDDENAPI_VERSION}.aar"
+
+      - name: Extract classes.jar from AAR
+        run: |
+          unzip -o hiddenapibypass.aar classes.jar -d hiddenapibypass_extracted
+          ls -la hiddenapibypass_extracted/
+          # Validasi bahwa file benar-benar JAR
+          file hiddenapibypass_extracted/classes.jar
 
       - name: Compile Java to .class
         run: |
           mkdir -p build/classes
           javac -source 8 -target 8 \
-            -cp "$ANDROID_HOME/platforms/$ANDROID_PLATFORM/android.jar:hiddenapibypass.jar" \
+            -cp "$ANDROID_HOME/platforms/$ANDROID_PLATFORM/android.jar:hiddenapibypass_extracted/classes.jar" \
             -d build/classes Loader.java
 
       - name: Convert to DEX with d8
@@ -59,7 +62,7 @@ jobs:
             --output build/dex \
             --lib "$ANDROID_HOME/platforms/$ANDROID_PLATFORM/android.jar" \
             --min-api 24 \
-            build/classes/aeeL/*.class hiddenapibypass.jar
+            build/classes/aeeL/*.class hiddenapibypass_extracted/classes.jar
 
       - name: Rename DEX file
         run: |
