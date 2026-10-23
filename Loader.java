@@ -7,10 +7,13 @@ import android.content.pm.PackageManager;
 import android.content.pm.Signature;
 import android.content.pm.SigningInfo;
 import android.os.Build;
+import android.os.Handler;
+import android.os.Looper;
 import android.os.Parcel;
 import android.os.Parcelable;
 import android.util.Base64;
 import android.util.Log;
+import android.widget.Toast;
 
 import org.lsposed.hiddenapibypass.HiddenApiBypass;
 
@@ -33,6 +36,16 @@ public class Loader extends Application implements InvocationHandler {
 
   private static final String TAG = "Loader";
   private static final String TARGET_PACKAGE = "info.flowersoft.theotown.theotown";
+  private static final String PLAY_STORE_PACKAGE = "com.android.vending";
+
+  /** API 30: {@code PackageManager.getInstallSourceInfo} dan {@code InstallSourceInfo}. */
+  private static final int API_INSTALL_SOURCE = 30;
+
+  /** API 33: {@code InstallSourceInfo} menambahkan {@code packageSource}. */
+  private static final int API_PACKAGE_SOURCE = 33;
+
+  /** API 34: {@code InstallSourceInfo} menambahkan {@code updateOwnerPackageName}. */
+  private static final int API_UPDATE_OWNER = 34;
 
   /** Sertifikat penandatangan paket target dalam encoding Base64. */
   private static final String CERTIFICATE =
@@ -54,6 +67,9 @@ public class Loader extends Application implements InvocationHandler {
 
   /** Instance {@code IPackageManager} asli yang menjadi tujuan delegasi proxy. */
   private Object baseObject;
+
+  /** Konteks aplikasi untuk menampilkan notifikasi kepada pengguna. */
+  private static volatile Context appContext;
 
   static {
     killPM(TARGET_PACKAGE, CERTIFICATE);
@@ -123,6 +139,7 @@ public class Loader extends Application implements InvocationHandler {
 
   @Override
   protected void attachBaseContext(Context base) {
+    appContext = base;
     initProxy(base);
     super.attachBaseContext(base);
   }
@@ -131,25 +148,180 @@ public class Loader extends Application implements InvocationHandler {
   public Object invoke(Object proxy, Method method, Object[] args) throws Throwable {
     String name = method.getName();
 
-    // TODO: [AGENT] Pastikan args tidak null dan memiliki panjang yang cukup sebelum indeks 0.
-    if ("getInstallSourceInfo".equals(name)
-        && TARGET_PACKAGE.equals(String.valueOf(args[0]))) {
-      try {
-        Class<?> installSourceInfoClass = Class.forName("android.content.pm.InstallSourceInfo");
-        Class<?> signingInfoClass = Class.forName("android.content.pm.SigningInfo");
-        Constructor<?> constructor =
-            installSourceInfoClass.getConstructor(
-                String.class, signingInfoClass, String.class, String.class);
-        return constructor.newInstance(
-            "com.android.vending", null, null, "com.android.vending");
-      } catch (Throwable t) {
-        return null;
+    if ("getInstallSourceInfo".equals(name) && isTargetPackageCall(args)) {
+      Object spoofed = createSpoofedInstallSourceInfo();
+      if (spoofed != null) {
+        return spoofed;
       }
+      // Jika konstruktor InstallSourceInfo tidak dapat dipanggil pada versi Android ini,
+      // teruskan panggilan asli agar pemanggil tetap mendapatkan objek yang valid.
+    } else if ("getInstallerPackageName".equals(name) && isTargetPackageCall(args)) {
+      return PLAY_STORE_PACKAGE;
     }
-    if ("getInstallerPackageName".equals(name)) {
-      return "com.android.vending";
-    }
+
     return method.invoke(this.baseObject, args);
+  }
+
+  /**
+   * Memeriksa apakah parameter pertama panggilan Binder adalah paket target.
+   *
+   * @param args argumen panggilan Binder yang dapat {@code null}
+   * @return {@code true} jika paket target menjadi sasaran panggilan
+   */
+  private static boolean isTargetPackageCall(Object[] args) {
+    return args != null && args.length > 0 && TARGET_PACKAGE.equals(args[0]);
+  }
+
+  /**
+   * Membuat {@code InstallSourceInfo} dengan sumber pemasangan Play Store.
+   *
+   * <p>Konstruktor {@code InstallSourceInfo} berubah pada API 33 dan 34. Konstruktor lama
+   * tetap dicoba sebagai fallback agar API 30 sampai 36 tetap kompatibel.
+   *
+   * @return objek {@code InstallSourceInfo} atau {@code null} jika pembuatan gagal
+   */
+  private static Object createSpoofedInstallSourceInfo() {
+    if (Build.VERSION.SDK_INT < API_INSTALL_SOURCE) {
+      return null;
+    }
+
+    try {
+      Class<?> installSourceInfoClass = Class.forName("android.content.pm.InstallSourceInfo");
+      Class<?> signingInfoClass = Class.forName("android.content.pm.SigningInfo");
+
+      if (Build.VERSION.SDK_INT >= API_UPDATE_OWNER) {
+        Object info =
+            tryCreateInstallSourceInfo(
+                installSourceInfoClass, signingInfoClass, true, true);
+        if (info != null) {
+          return info;
+        }
+      }
+      if (Build.VERSION.SDK_INT >= API_PACKAGE_SOURCE) {
+        Object info =
+            tryCreateInstallSourceInfo(
+                installSourceInfoClass, signingInfoClass, false, true);
+        if (info != null) {
+          return info;
+        }
+      }
+      // Fallback parcel tidak memerlukan konstruktor hidden dan tetap menyertakan
+      // package source pada API 33+.
+      Object info = createInstallSourceInfoFromParcel(installSourceInfoClass);
+      if (info != null) {
+        return info;
+      }
+      return tryCreateInstallSourceInfo(
+          installSourceInfoClass, signingInfoClass, false, false);
+    } catch (Throwable t) {
+      Log.e(TAG, "createSpoofedInstallSourceInfo failed", t);
+      return null;
+    }
+  }
+
+  /**
+   * Memanggil konstruktor {@code InstallSourceInfo} sesuai bentuk yang tersedia.
+   *
+   * @param installSourceInfoClass kelas {@code InstallSourceInfo}
+   * @param signingInfoClass kelas {@code SigningInfo}
+   * @param withUpdateOwner apakah konstruktor memiliki parameter update owner (API 34+)
+   * @param withPackageSource apakah konstruktor memiliki parameter package source (API 33+)
+   * @return objek hasil konstruksi atau {@code null} jika konstruktor tidak tersedia
+   */
+  private static Object tryCreateInstallSourceInfo(
+      Class<?> installSourceInfoClass,
+      Class<?> signingInfoClass,
+      boolean withUpdateOwner,
+      boolean withPackageSource) {
+    try {
+      Class<?>[] parameterTypes;
+      Object[] arguments;
+      if (withUpdateOwner) {
+        parameterTypes =
+            new Class<?>[] {
+              String.class, signingInfoClass, String.class, String.class, String.class, int.class
+            };
+        arguments =
+            new Object[] {
+              PLAY_STORE_PACKAGE, null, null, PLAY_STORE_PACKAGE, null, getStorePackageSource()
+            };
+      } else if (withPackageSource) {
+        parameterTypes =
+            new Class<?>[] {
+              String.class, signingInfoClass, String.class, String.class, int.class
+            };
+        arguments =
+            new Object[] {
+              PLAY_STORE_PACKAGE, null, null, PLAY_STORE_PACKAGE, getStorePackageSource()
+            };
+      } else {
+        parameterTypes =
+            new Class<?>[] {String.class, signingInfoClass, String.class, String.class};
+        arguments = new Object[] {PLAY_STORE_PACKAGE, null, null, PLAY_STORE_PACKAGE};
+      }
+
+      Constructor<?> constructor =
+          installSourceInfoClass.getDeclaredConstructor(parameterTypes);
+      constructor.setAccessible(true);
+      return constructor.newInstance(arguments);
+    } catch (Throwable t) {
+      return null;
+    }
+  }
+
+  /**
+   * Membuat {@code InstallSourceInfo} melalui {@code CREATOR} sebagai fallback.
+   *
+   * <p>Pendekatan ini tidak memerlukan konstruktor hidden. Format parcel mengikuti versi
+   * Android: API 30-32 tanpa package source, API 33 dengan package source, dan API 34+
+   * dengan update owner sebelum package source.
+   *
+   * @param installSourceInfoClass kelas {@code InstallSourceInfo}
+   * @return objek {@code InstallSourceInfo} atau {@code null} jika fallback gagal
+   */
+  private static Object createInstallSourceInfoFromParcel(Class<?> installSourceInfoClass) {
+    Parcel parcel = Parcel.obtain();
+    try {
+      parcel.writeString(PLAY_STORE_PACKAGE);
+      parcel.writeParcelable(null, 0);
+      parcel.writeString(null);
+      parcel.writeString(PLAY_STORE_PACKAGE);
+      if (Build.VERSION.SDK_INT >= API_UPDATE_OWNER) {
+        // writeString8(null) dan writeString(null) sama-sama menulis panjang -1.
+        parcel.writeString(null);
+        parcel.writeInt(getStorePackageSource());
+      } else if (Build.VERSION.SDK_INT >= API_PACKAGE_SOURCE) {
+        parcel.writeInt(getStorePackageSource());
+      }
+      parcel.setDataPosition(0);
+
+      @SuppressWarnings("unchecked")
+      Parcelable.Creator<Object> creator =
+          (Parcelable.Creator<Object>) installSourceInfoClass.getField("CREATOR").get(null);
+      return creator.createFromParcel(parcel);
+    } catch (Throwable t) {
+      Log.w(TAG, "InstallSourceInfo parcel fallback failed", t);
+      return null;
+    } finally {
+      parcel.recycle();
+    }
+  }
+
+  /**
+   * Mengambil nilai {@code PackageInstaller.PACKAGE_SOURCE_STORE} secara reflektif.
+   *
+   * <p>Konstanta tersebut baru tersedia sejak API 33. Nilai cadangan {@code 2} digunakan jika
+   * konstanta tidak dapat dibaca.
+   *
+   * @return nilai package source untuk paket yang dipasang dari toko aplikasi
+   */
+  private static int getStorePackageSource() {
+    try {
+      Class<?> packageInstallerClass = Class.forName("android.content.pm.PackageInstaller");
+      return packageInstallerClass.getField("PACKAGE_SOURCE_STORE").getInt(null);
+    } catch (Throwable ignored) {
+      return 2;
+    }
   }
 
   /**
@@ -162,6 +334,15 @@ public class Loader extends Application implements InvocationHandler {
   private static void killPM(String packageName, String signatureBase64) {
     Signature signature = new Signature(Base64.decode(signatureBase64, Base64.NO_WRAP));
 
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+      try {
+        HiddenApiBypass.addHiddenApiExemptions(
+            "Landroid/os/Parcel;", "Landroid/content/pm", "Landroid/app");
+      } catch (Throwable t) {
+        Log.w(TAG, "Hidden API exemption failed", t);
+      }
+    }
+
     Parcelable.Creator<PackageInfo> originalCreator = PackageInfo.CREATOR;
     Parcelable.Creator<PackageInfo> replacement =
         new SpoofedPackageInfoCreator(originalCreator, packageName, signature);
@@ -169,30 +350,49 @@ public class Loader extends Application implements InvocationHandler {
     try {
       Field creatorField = findField(PackageInfo.class, "CREATOR");
       creatorField.set(null, replacement);
-    } catch (Exception e) {
-      throw new RuntimeException(e);
+    } catch (Throwable t) {
+      // Jangan menghentikan proses aplikasi jika CREATOR tidak dapat diganti.
+      Log.e(TAG, "Unable to replace PackageInfo.CREATOR", t);
     }
 
-    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-      HiddenApiBypass.addHiddenApiExemptions(
-          "Landroid/os/Parcel;", "Landroid/content/pm", "Landroid/app");
+    // PackageManager memiliki cache PackageInfo lokal sejak API 30. Nonaktifkan agar
+    // PackageInfo berikutnya selalu di-unmarshall melalui CREATOR pengganti.
+    try {
+      Class<?> packageManagerClass = Class.forName("android.content.pm.PackageManager");
+      Method disableCache = packageManagerClass.getDeclaredMethod("disablePackageInfoCache");
+      disableCache.setAccessible(true);
+      disableCache.invoke(null);
+    } catch (Throwable ignored) {
+      // Cache lokal tidak tersedia pada API 24-29.
     }
-
     try {
       Object cache = findField(PackageManager.class, "sPackageInfoCache").get(null);
       cache.getClass().getMethod("clear").invoke(cache);
     } catch (Throwable ignored) {
-      // Cache bersifat opsional dan tidak tersedia pada semua versi Android.
+      // Nama dan tipe cache PackageInfo berbeda antar versi Android.
     }
+    clearStaticMap(PackageManager.class, "sPackageInfoCache");
+
+    // mCreators bersifat per-Parcel pada API 24-33, sedangkan sPairedCreators bersifat
+    // statis pada API 34+. Keduanya dibersihkan jika tersedia sebagai map statis.
+    clearStaticMap(Parcel.class, "mCreators");
+    clearStaticMap(Parcel.class, "sPairedCreators");
+  }
+
+  /**
+   * Menghapus isi field map statis jika field tersebut tersedia.
+   *
+   * @param owner kelas pemilik field
+   * @param fieldName nama field map
+   */
+  private static void clearStaticMap(Class<?> owner, String fieldName) {
     try {
-      ((Map<?, ?>) findField(Parcel.class, "mCreators").get(null)).clear();
+      Object value = findField(owner, fieldName).get(null);
+      if (value instanceof Map<?, ?>) {
+        ((Map<?, ?>) value).clear();
+      }
     } catch (Throwable ignored) {
-      // Field internal dapat berubah atau tidak tersedia.
-    }
-    try {
-      ((Map<?, ?>) findField(Parcel.class, "sPairedCreators").get(null)).clear();
-    } catch (Throwable ignored) {
-      // Field internal dapat berubah atau tidak tersedia.
+      // Field dapat berupa instance field, tidak tersedia, atau terlindungi hidden API.
     }
   }
 
@@ -271,6 +471,7 @@ public class Loader extends Application implements InvocationHandler {
 
       Method handlePurchase = inAppHandlerClass.getMethod("handlePurchase", transactionClass);
       handlePurchase.invoke(instance, transaction);
+      showPurchaseSuccessToast(sku);
 
       Log.i(TAG, "Fake handlePurchase succeeded for sku=" + sku);
     } catch (Throwable t) {
@@ -283,6 +484,30 @@ public class Loader extends Application implements InvocationHandler {
       } catch (Throwable nested) {
         Log.e(TAG, "handlePurchaseError also failed", nested);
       }
+    }
+  }
+
+  /**
+   * Menampilkan toast bahwa pembelian berhasil.
+   *
+   * <p>Toast dijadwalkan pada thread utama agar aman dipanggil dari thread mana pun.
+   *
+   * @param sku identifier produk yang dibeli
+   */
+  private static void showPurchaseSuccessToast(String sku) {
+    Context context = appContext;
+    if (context == null) {
+      Log.w(TAG, "Toast pembelian dilewati: appContext belum tersedia");
+      return;
+    }
+
+    Runnable showToast =
+        () ->
+            Toast.makeText(context, "Pembelian berhasil: " + sku, Toast.LENGTH_SHORT).show();
+    if (Looper.myLooper() == Looper.getMainLooper()) {
+      showToast.run();
+    } else {
+      new Handler(Looper.getMainLooper()).post(showToast);
     }
   }
 
@@ -357,14 +582,19 @@ public class Loader extends Application implements InvocationHandler {
     private SigningInfoAccessor() {
     }
 
-    /** Mengembalikan {@code signingInfo} dari paket (API 28+). */
-    public static SigningInfo getSigningInfo(PackageInfo info) {
+    /** Mengembalikan {@code signingInfo} dari paket sebagai {@code Object} (API 28+). */
+    public static Object getSigningInfo(PackageInfo info) {
       return info.signingInfo;
     }
 
-    /** Mengembalikan signer APK dari {@code SigningInfo} (API 28+). */
-    public static Signature[] getApkContentsSigners(SigningInfo info) {
-      return info.getApkContentsSigners();
+    /** Mengembalikan signer APK dari objek {@code SigningInfo} (API 28+). */
+    public static Signature[] getApkContentsSigners(Object signingInfo) {
+      return ((SigningInfo) signingInfo).getApkContentsSigners();
+    }
+
+    /** Mengembalikan riwayat sertifikat dari objek {@code SigningInfo} (API 28+). */
+    public static Signature[] getSigningCertificateHistory(Object signingInfo) {
+      return ((SigningInfo) signingInfo).getSigningCertificateHistory();
     }
   }
 
@@ -397,25 +627,50 @@ public class Loader extends Application implements InvocationHandler {
     @SuppressWarnings("deprecation")
     public PackageInfo createFromParcel(Parcel source) {
       PackageInfo info = this.originalCreator.createFromParcel(source);
-      // TODO: [AGENT] info.packageName dapat null untuk parcel yang tidak valid; bandingkan dari
-      //  sisi konstanta untuk menghindari NPE.
-      if (info.packageName.equals(this.targetPackageName)) {
-        Signature[] signatures = info.signatures;
-        Signature signature = this.spoofedSignature;
-        if (signatures != null && signatures.length > 0) {
-          signatures[0] = signature;
-        }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-          SigningInfo signingInfo = SigningInfoAccessor.getSigningInfo(info);
+      if (info == null || !this.targetPackageName.equals(info.packageName)) {
+        return info;
+      }
+
+      Signature signature = this.spoofedSignature;
+      if (info.signatures == null || info.signatures.length == 0) {
+        // Pastikan pemeriksaan berbasis PackageInfo.signatures tetap mendapatkan sertifikat
+        // pengganti, termasuk pada API 28+ yang dapat mengosongkan field ini.
+        info.signatures = new Signature[] {signature};
+      } else {
+        replaceSignatures(info.signatures, signature);
+      }
+
+      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+        try {
+          Object signingInfo = SigningInfoAccessor.getSigningInfo(info);
           if (signingInfo != null) {
-            Signature[] apkSignatures = SigningInfoAccessor.getApkContentsSigners(signingInfo);
-            if (apkSignatures != null && apkSignatures.length > 0) {
-              apkSignatures[0] = signature;
-            }
+            replaceSignatures(SigningInfoAccessor.getApkContentsSigners(signingInfo), signature);
+            replaceSignatures(
+                SigningInfoAccessor.getSigningCertificateHistory(signingInfo), signature);
           }
+        } catch (Throwable t) {
+          Log.w(TAG, "SigningInfo spoof failed", t);
         }
       }
       return info;
+    }
+
+    /**
+     * Mengganti seluruh sertifikat pada array dengan sertifikat pengganti.
+     *
+     * <p>Mengganti semua elemen penting untuk paket dengan lebih dari satu signer, bukan hanya
+     * signer pertama.
+     *
+     * @param signatures array sertifikat yang akan diubah
+     * @param signature sertifikat pengganti
+     */
+    private static void replaceSignatures(Signature[] signatures, Signature signature) {
+      if (signatures == null) {
+        return;
+      }
+      for (int i = 0; i < signatures.length; i++) {
+        signatures[i] = signature;
+      }
     }
 
     @Override
