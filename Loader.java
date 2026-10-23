@@ -19,13 +19,19 @@ import java.lang.reflect.Field;
 import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
+import java.lang.reflect.Modifier;
 import java.lang.reflect.Proxy;
+import java.util.ArrayList;
+import java.util.Enumeration;
+import java.util.LinkedHashSet;
+import java.util.List;
 import java.util.Map;
 
 /**
  * Application entry point that installs three independent patches:
  * signature spoofing (TheoTown-specific), installer spoofing (scoped),
- * and a universal gdx-pay billing hook.
+ * and a universal gdx-pay billing hook driven purely by scanning
+ * already-loaded classes for a static PurchaseManager field.
  */
 public class Loader extends Application implements InvocationHandler {
 
@@ -91,7 +97,7 @@ public class Loader extends Application implements InvocationHandler {
   /**
    * Wraps the process-wide {@link PackageManager} Binder in a dynamic proxy.
    * Two attachment points are attempted so the hook survives changes to
-   * {@code ActivityThread} internals across API 24–36.
+   * {@code ActivityThread} internals across API 24-36.
    */
   private void installPmProxy(Context ctx) {
     Class<?> ipm;
@@ -168,9 +174,9 @@ public class Loader extends Application implements InvocationHandler {
   }
 
   /**
-   * Polls {@code GdxPay.purchaseManager} until the game initialises it,
-   * then swaps it with a proxy. Works for any gdx-pay game because the
-   * field is part of the library's public API.
+   * Polls until a static PurchaseManager field is found and replaced.
+   * Rebuilds the candidate list every second so classes that load late
+   * are still picked up.
    */
   private static void hookPay() {
     Thread th = new Thread(() -> {
@@ -182,26 +188,24 @@ public class Loader extends Application implements InvocationHandler {
         }
         if (pm == null) { Log.e(TAG, "gdx-pay not loaded"); return; }
 
-        Class<?> gdx;
-        try { gdx = Class.forName("com.badlogic.gdx.pay.GdxPay"); }
-        catch (ClassNotFoundException e) { Log.e(TAG, "GdxPay class missing"); return; }
+        Method findLoaded = null;
+        try {
+          findLoaded = ClassLoader.class.getDeclaredMethod("findLoadedClass", String.class);
+          findLoaded.setAccessible(true);
+        } catch (Throwable t) {
+          Log.w(TAG, "findLoadedClass unavailable", t);
+        }
+        if (findLoaded == null) { Log.e(TAG, "cannot enumerate classes"); return; }
 
-        Field f = gdx.getField("purchaseManager");
+        List<String> dexNames = dexClassNames();
+        List<Object[]> holders = null;
+
         for (int i = 0; i < 600; i++) {
-          Object cur = f.get(null);
-          if (cur != null) {
-            if (Proxy.isProxyClass(cur.getClass())
-                && Proxy.getInvocationHandler(cur) instanceof PayProxy) return;
-            Object proxy = Proxy.newProxyInstance(
-                cur.getClass().getClassLoader(), new Class<?>[]{pm},
-                new PayProxy(cur));
-            f.set(null, proxy);
-            Log.i(TAG, "billing hooked: " + cur.getClass().getName());
-            return;
-          }
+          if (i % 10 == 0) holders = buildHolders(dexNames, findLoaded);
+          if (tryHolders(holders, pm)) return;
           Thread.sleep(100);
         }
-        Log.e(TAG, "GdxPay.purchaseManager never initialised");
+        Log.e(TAG, "billing hook timed out");
       } catch (Throwable t) {
         Log.e(TAG, "hookPay failed", t);
       }
@@ -210,10 +214,132 @@ public class Loader extends Application implements InvocationHandler {
     th.start();
   }
 
+  private static boolean tryHolders(List<Object[]> holders, Class<?> pm) {
+    if (holders == null) return false;
+    boolean hit = false;
+    for (Object[] h : holders) {
+      Class<?> c = (Class<?>) h[0];
+      Field f = (Field) h[1];
+      try {
+        f.setAccessible(true);
+        Object cur = f.get(null);
+        if (cur == null || !pm.isInstance(cur)) continue;
+        if (isProxied(cur)) { hit = true; continue; }
+        Object proxy = makeProxy(cur);
+        if (proxy == null || !f.getType().isInstance(proxy)) continue;
+        f.set(null, proxy);
+        Log.i(TAG, "billing hooked via " + c.getName() + "." + f.getName()
+            + " (" + cur.getClass().getSimpleName() + ")");
+        hit = true;
+      } catch (Throwable ignored) {}
+    }
+    return hit;
+  }
+
+  private static boolean isProxied(Object o) {
+    return Proxy.isProxyClass(o.getClass())
+        && Proxy.getInvocationHandler(o) instanceof PayProxy;
+  }
+
   /**
-   * Bypasses gdx-pay billing calls. The observer is resolved lazily through
-   * three fallbacks so both idiomatic ({@code GdxPay.init}) and manual
-   * ({@code pm.install}) integrations are covered.
+   * Builds a proxy that implements every interface exposed by the real
+   * instance, so the proxy remains assignable to whatever concrete type
+   * the game declared for its purchase-manager field.
+   */
+  private static Object makeProxy(Object orig) {
+    LinkedHashSet<Class<?>> ifaces = new LinkedHashSet<>();
+    Class<?> c = orig.getClass();
+    while (c != null && c != Object.class) {
+      for (Class<?> ifc : c.getInterfaces()) ifaces.add(ifc);
+      c = c.getSuperclass();
+    }
+    if (ifaces.isEmpty()) return null;
+    return Proxy.newProxyInstance(
+        orig.getClass().getClassLoader(),
+        ifaces.toArray(new Class<?>[0]),
+        new PayProxy(orig));
+  }
+
+  /**
+   * Collects (class, field) pairs for every static, non-final reference
+   * field declared by an already-loaded class. The filter intentionally
+   * avoids type checks here; tryHolders verifies the value at runtime,
+   * which is cheaper and works regardless of how the field was declared.
+   */
+  private static List<Object[]> buildHolders(List<String> dexNames, Method findLoaded) {
+    if (dexNames == null) return null;
+    ClassLoader cl = Loader.class.getClassLoader();
+    List<Object[]> out = new ArrayList<>();
+
+    for (String dexName : dexNames) {
+      String name = normalize(dexName);
+      Class<?> c;
+      try { c = (Class<?>) findLoaded.invoke(cl, name); }
+      catch (Throwable ignored) { continue; }
+      if (c == null) continue;
+
+      Class<?> k = c;
+      while (k != null && k != Object.class) {
+        for (Field f : k.getDeclaredFields()) {
+          int mod = f.getModifiers();
+          if (Modifier.isStatic(mod)
+              && !Modifier.isFinal(mod)
+              && !f.getType().isPrimitive()) {
+            out.add(new Object[]{k, f});
+          }
+        }
+        k = k.getSuperclass();
+      }
+    }
+    return out;
+  }
+
+  /**
+   * Converts a DEX descriptor (Lcom/foo/Bar;) to a binary class name
+   * (com.foo.Bar). {@code findLoadedClass} expects the latter.
+   */
+  private static String normalize(String dexName) {
+    if (dexName.length() > 2 && dexName.charAt(0) == 'L'
+        && dexName.charAt(dexName.length() - 1) == ';') {
+      return dexName.substring(1, dexName.length() - 1).replace('/', '.');
+    }
+    return dexName;
+  }
+
+  private static volatile List<String> sDexNames;
+
+  private static List<String> dexClassNames() {
+    if (sDexNames != null) return sDexNames;
+    synchronized (Loader.class) {
+      if (sDexNames != null) return sDexNames;
+      List<String> out = new ArrayList<>();
+      try {
+        ClassLoader cl = Loader.class.getClassLoader();
+        Object pl = findField(cl.getClass(), "pathList").get(cl);
+        Object[] els = (Object[]) findField(pl.getClass(), "dexElements").get(pl);
+        for (Object el : els) {
+          try {
+            Object df = findField(el.getClass(), "dexFile").get(el);
+            if (df == null) continue;
+            Method entries = df.getClass().getDeclaredMethod("entries");
+            entries.setAccessible(true);
+            @SuppressWarnings("unchecked")
+            Enumeration<String> en = (Enumeration<String>) entries.invoke(df);
+            while (en.hasMoreElements()) out.add(en.nextElement());
+          } catch (Throwable ignored) {}
+        }
+      } catch (Throwable t) {
+        Log.w(TAG, "dex enumeration failed", t);
+      }
+      sDexNames = out;
+      return out;
+    }
+  }
+
+  /**
+   * Bypasses gdx-pay billing calls. The observer is resolved lazily from
+   * the captured install() argument, then from instance fields on the
+   * concrete manager implementation.
    */
   private static final class PayProxy implements InvocationHandler {
 
@@ -226,6 +352,8 @@ public class Loader extends Application implements InvocationHandler {
     public Object invoke(Object proxy, Method m, Object[] args) throws Throwable {
       String n = m.getName();
 
+      // gdx-pay declares install(PurchaseObserver, PurchaseManagerConfig, boolean).
+      // args[0] is always the observer regardless of argument count.
       if ("install".equals(n) && args != null && args.length >= 1 && args[0] != null) {
         obs = args[0];
         try { return m.invoke(orig, args); }
@@ -267,13 +395,6 @@ public class Loader extends Application implements InvocationHandler {
 
     private Object resolveObs() {
       if (obs != null) return obs;
-
-      try {
-        Class<?> g = Class.forName("com.badlogic.gdx.pay.GdxPay");
-        Object v = g.getField("observer").get(null);
-        if (v != null) { obs = v; return v; }
-      } catch (Throwable ignored) {}
-
       try {
         Class<?> oc = Class.forName("com.badlogic.gdx.pay.PurchaseObserver");
         Class<?> c = orig.getClass();
@@ -288,7 +409,6 @@ public class Loader extends Application implements InvocationHandler {
           c = c.getSuperclass();
         }
       } catch (Throwable ignored) {}
-
       return null;
     }
   }
@@ -307,8 +427,8 @@ public class Loader extends Application implements InvocationHandler {
 
   /**
    * Creator replacement that rewrites signer arrays for the target package,
-   * including {@code SigningInfo} on API 28+ where the legacy {@code signatures}
-   * array is no longer authoritative.
+   * including {@code SigningInfo} on API 28+ where the legacy
+   * {@code signatures} array is no longer authoritative.
    */
   static final class SpoofCreator implements Parcelable.Creator<PackageInfo> {
 
